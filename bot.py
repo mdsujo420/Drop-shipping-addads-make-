@@ -19,7 +19,7 @@ MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.12"))
 VOICES = ["Kore", "Puck", "Charon"]
 IMG_SIZES = {"1x1": (1080, 1080), "4x5": (1080, 1350), "9x16": (1080, 1920), "landscape": (1200, 628)}
 VID_SIZES = {"9x16": (1080, 1920), "4x5": (1080, 1350)}  # add "1x1": (1080, 1080) if you want
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options=types.HttpOptions(timeout=240000))
 STATE = {}
 LAST = [time.time()]
 WARN = []
@@ -49,10 +49,12 @@ Product brief from the seller:
 {brief}
 The attached photos show the real product. Rules: US English, no medical/income claims, no fake reviews,
 no fake scarcity, no claims the brief does not support.
+Never mention any price or dollar amount in any output: customers buy on the seller's own website, so CTAs say things like Shop Now (use the store name if one is given, also on the end card).
+The seller's product title is long and supplier-written: rewrite it as a short SEO title (max 60 characters, main keyword first, natural wording, no emojis, no ALL CAPS, no keyword stuffing). meta_description max 155 characters.
 Write EVERYTHING in American English: every field, including style names, captions, voiceover, headlines, hashtags, targeting and the tip.
-The seller's brief may be in Bengali or another language; translate its meaning, never output non-English text, and use US spelling, US units and USD prices.
+The seller's brief may be in Bengali or another language; translate its meaning, never output non-English text, and use US spelling and US units.
 Return ONLY JSON with this shape:
-{{"product":str,"cta":str,
+{{"product":str,"cta":str,"seo":{{"title":str,"alternatives":[2 str],"meta_description":str}},
 "images":[5 objects {{"style":str,"prompt":str,"headline":str}}],
 "videos":[3 objects {{"style":str,"voice":str,"captions":[5-6 strings, max 7 words each],"end_card":str}}],
 "meta":{{"headlines":[5 str],"primary_texts":[3 str],"descriptions":[3 str],"cta_button":str,"targeting":[6 str]}},
@@ -218,15 +220,15 @@ async def guard(u: Update):
     return True
 
 Q = {
-    "name": "ধাপ ১/৭: প্রোডাক্টের নাম লিখুন।\nযেমন: Rechargeable Hand Warmer\n(ইংরেজিতে লিখলে ভালো, বিজ্ঞাপনে এই নামই ব্যবহার হবে।)",
-    "desc": "ধাপ ২/৭: প্রোডাক্টের বর্ণনা লিখুন (৩–৫ লাইন)।\nলিখবেন: এটা কী কাজ করে, কার কোন সমস্যা মেটায়, বিশেষত্ব কী (ব্যাটারি, সাইজ, ম্যাটেরিয়াল, কয়টা মোড ইত্যাদি)।\nসত্যি তথ্যই লিখবেন। বাড়িয়ে বা মিথ্যা কিছু লিখলে বিজ্ঞাপনেও সেটাই যাবে, তাতে অ্যাড বন্ধ হতে পারে।\nবাংলায় লিখলেও চলবে, বিজ্ঞাপন ইংরেজিতে হবে।",
-    "price": "ধাপ ৩/৭: বিক্রয় মূল্য ডলারে লিখুন।\nযেমন: $29.99\nকম্বো বা অফার দাম থাকলে সেটাও লিখুন, যেমন: 1 for $29.99, 2 for $49.99",
-    "audience": "ধাপ ৪/৭: কাদের কাছে বেচবেন?\nযেমন: ঠান্ডা এলাকার কর্মজীবী মানুষ, প্রিয়জনকে গিফট দিতে চান এমন ক্রেতা, ২৫–৪৫ বছরের মহিলা।\nঠিক না জানলে skip লিখুন, আমি প্রোডাক্ট দেখে অনুমান করব।",
-    "offer": "ধাপ ৫/৭: কোনো অফার আছে? (ঐচ্ছিক)\nযেমন: Free shipping, 20% off today, Buy 2 Get 1 Free\nঅফার না থাকলে skip লিখুন। (শুধু সত্যিকারের অফার লিখুন।)",
-    "photos": "ধাপ ৬/৭: প্রোডাক্টের ছবি পাঠান (১–৩টি)।\nভালো ছবি: পরিষ্কার, প্রোডাক্ট পুরোটা দেখা যায়, ঝাপসা না, ওয়াটারমার্ক ছাড়া। ভিন্ন কোণ থেকে নিলে ভালো।\nএকটা একটা করে পাঠান। সব পাঠানো হলে done লিখুন (৩টি দিলে নিজে থেকেই পরের ধাপে যাবে)।",
-    "video": "ধাপ ৭/৭: প্রোডাক্টের ছোট ভিডিও পাঠান (ঐচ্ছিক)।\n১৫–৩০ সেকেন্ড, ২০MB-এর নিচে, প্রোডাক্ট ব্যবহার করে দেখানো হলে সবচেয়ে ভালো।\nএটা দিলে তৃতীয় ভিডিওটা আপনার ভিডিও কেটে বানানো হবে। না থাকলে skip লিখুন।",
+    "photos": "ধাপ ১/৭: প্রোডাক্টের ৩টি ছবি পাঠান (বাধ্যতামূলক)।\nভালো ছবি: পরিষ্কার, প্রোডাক্ট পুরোটা দেখা যায়, ঝাপসা না, ওয়াটারমার্ক ছাড়া, ভিন্ন ভিন্ন কোণ থেকে তোলা।\nএকটা একটা করে পাঠান। ৩টি হলে নিজে থেকেই পরের ধাপে যাব।",
+    "video": "ধাপ ২/৭: প্রোডাক্টের একটি ছোট ভিডিও পাঠান (বাধ্যতামূলক)।\n১৫–৩০ সেকেন্ড, প্রোডাক্ট ব্যবহার করে দেখানো হলে সবচেয়ে ভালো।\nএই ভিডিও কেটেই একটি অ্যাড ভিডিও বানানো হবে।\nসাইজ ২০MB-এর নিচে রাখুন, এর বেশি হলে বট নামাতে পারে না।",
+    "title": "ধাপ ৩/৭: প্রোডাক্টের টাইটেল লিখুন (বাধ্যতামূলক)।\nসাপ্লায়ারের লম্বা টাইটেল হুবহু পেস্ট করলেও চলবে। আমি সেটাকে ছোট ও SEO-ফ্রেন্ডলি করে দেব।",
+    "desc": "ধাপ ৪/৭: প্রোডাক্টের ডেসক্রিপশন দিন (বাধ্যতামূলক)।\nসাপ্লায়ারের ডেসক্রিপশন পেস্ট করলেও হবে, বাংলায় বা ইংরেজিতে।\nএর ভিত্তিতেই অ্যাড, ভিডিও আর সব টেক্সট বানানো হবে। শুধু সত্যি তথ্য থাকলে ভালো, বাড়িয়ে বলা দাবি থাকলে অ্যাড বন্ধ হতে পারে।",
+    "audience": "ধাপ ৫/৭: (ঐচ্ছিক) কাদের কাছে বেচবেন?\nযেমন: গিফট খুঁজছেন এমন মানুষ, বাচ্চাদের মা-বাবা, ২৫–৪৫ বছরের মহিলা।\nনা জানলে skip লিখুন, আমি প্রোডাক্ট দেখে অনুমান করব।",
+    "offer": "ধাপ ৬/৭: (ঐচ্ছিক) কোনো অফার আছে?\nযেমন: Free shipping, 20% off today, Buy 2 Get 1 Free।\nদামের সংখ্যা অ্যাডে দেখানো হবে না, কারণ ক্রেতা আপনার ওয়েবসাইট থেকে কিনবে। শুধু সত্যিকারের অফার লিখুন। না থাকলে skip।",
+    "brand": "ধাপ ৭/৭: (ঐচ্ছিক) আপনার স্টোরের নাম লিখুন, যেমন: CozyNest।\nভিডিও ও ছবির শেষে \"Shop now at CozyNest\" ধাঁচের CTA আসবে। না থাকলে skip।",
 }
-ORDER = ["name", "desc", "price", "audience", "offer", "photos", "video", "confirm"]
+ORDER = ["photos", "video", "title", "desc", "audience", "offer", "brand", "confirm"]
 
 def advance(s): s["step"] = ORDER[ORDER.index(s["step"]) + 1]
 
@@ -235,8 +237,8 @@ async def ask(u, s):
         return await u.message.reply_text(Q[s["step"]])
     await u.message.reply_text(
         "সব তথ্য পেয়েছি:\n"
-        f"• নাম: {s['name']}\n• দাম: {s['price']}\n• অডিয়েন্স: {s['audience'] or 'অনুমান করা হবে'}\n"
-        f"• অফার: {s['offer'] or 'নেই'}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: {'আছে' if s['video'] else 'নেই'}\n\n"
+        f"• টাইটেল: {s['title'][:120]}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: আছে\n"
+        f"• অডিয়েন্স: {s['audience'] or 'অনুমান করা হবে'}\n• অফার: {s['offer'] or 'নেই'}\n• স্টোর: {s['brand'] or 'নেই'}\n\n"
         "সব ঠিক থাকলে /go লিখুন। নতুন করে শুরু করতে /new।")
 
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -245,9 +247,9 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def new(u, c):
     if not await guard(u): return
-    s = STATE[u.effective_chat.id] = {"step": "name", "photos": [], "video": None, "busy": False,
-                                      "name": "", "desc": "", "price": "", "audience": "", "offer": ""}
-    await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ।")
+    s = STATE[u.effective_chat.id] = {"step": "photos", "photos": [], "video": None, "busy": False,
+                                      "title": "", "desc": "", "audience": "", "offer": "", "brand": ""}
+    await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ: প্রথম ৪টি বাধ্যতামূলক, শেষ ৩টি ঐচ্ছিক।")
     await ask(u, s)
 
 def st(u): return STATE.get(u.effective_chat.id)
@@ -257,14 +259,13 @@ async def on_photo(u, c):
     s = st(u)
     if not s or s["step"] != "photos":
         return await u.message.reply_text("এখন ছবির ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন, বা /new দিয়ে নতুন করে শুরু করুন।")
-    if len(s["photos"]) >= 3:
-        return await u.message.reply_text("৩টি ছবি হয়ে গেছে। done লিখুন।")
+    if len(s["photos"]) >= 3: return
     f = await u.message.photo[-1].get_file(); s["photos"].append(bytes(await f.download_as_bytearray()))
     n = len(s["photos"])
     if n >= 3:
         await u.message.reply_text("ছবি ৩/৩ পেয়েছি।"); advance(s); await ask(u, s)
     else:
-        await u.message.reply_text(f"ছবি {n}/৩ পেয়েছি। আরও পাঠান, অথবা done লিখুন।")
+        await u.message.reply_text(f"ছবি {n}/৩ পেয়েছি। আরও {3 - n}টি পাঠান।")
 
 async def on_video(u, c):
     if not await guard(u): return
@@ -275,7 +276,7 @@ async def on_video(u, c):
         f = await u.message.video.get_file()
         p = Path(tempfile.mkdtemp()) / "user.mp4"; await f.download_to_drive(p); s["video"] = p
     except Exception:
-        return await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে পাঠান, অথবা skip লিখুন।")
+        return await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে আবার পাঠান।")
     await u.message.reply_text("ভিডিও পেয়েছি।"); advance(s); await ask(u, s)
 
 async def on_text(u, c):
@@ -283,18 +284,11 @@ async def on_text(u, c):
     s = st(u)
     if not s: return await u.message.reply_text("শুরু করতে /new লিখুন।")
     k, t = s["step"], u.message.text.strip()
-    low = t.lower()
-    if k in ("name", "desc", "price"):
-        s[k] = t
-    elif k in ("audience", "offer"):
-        s[k] = "" if low == "skip" else t
-    elif k == "photos":
-        if low != "done": return await u.message.reply_text("ছবি পাঠান। সব ছবি পাঠানো হলে done লিখুন।")
-        if not s["photos"]: return await u.message.reply_text("কমপক্ষে ১টি ছবি লাগবে। ছবি পাঠান।")
-    elif k == "video":
-        if low != "skip": return await u.message.reply_text("ভিডিও পাঠান, অথবা skip লিখুন।")
-    else:
-        return await u.message.reply_text("সব তথ্য জমা হয়েছে। শুরু করতে /go, নতুন করে শুরু করতে /new।")
+    if k == "photos": return await u.message.reply_text(f"এখন ছবি পাঠান ({len(s['photos'])}/৩ পেয়েছি)।")
+    if k == "video": return await u.message.reply_text("এখন ভিডিও পাঠান (বাধ্যতামূলক)।")
+    if k in ("title", "desc"): s[k] = t
+    elif k in ("audience", "offer", "brand"): s[k] = "" if t.lower() == "skip" else t
+    else: return await u.message.reply_text("সব তথ্য জমা হয়েছে। শুরু করতে /go, নতুন করে শুরু করতে /new।")
     advance(s); await ask(u, s)
 
 async def send_text(u, title, blocks):
@@ -304,15 +298,17 @@ async def send_text(u, title, blocks):
 async def go(u, c):
     if not await guard(u): return
     s = st(u)
-    if not s or not s["photos"] or not s["name"] or not s["desc"]: return await u.message.reply_text("আগে /new দিয়ে সব ধাপের উত্তর দিন।")
+    if not s or len(s["photos"]) < 3 or not s["video"] or not s["title"] or not s["desc"]: return await u.message.reply_text("আগে /new দিয়ে ৩টি ছবি, ভিডিও, টাইটেল ও ডেসক্রিপশন দিন।")
     if s["busy"]: return await u.message.reply_text("আগের কাজ চলছে।")
     s["busy"] = True
     try:
         tmp = tempfile.mkdtemp()
         await u.message.reply_text("পরিকল্পনা তৈরি হচ্ছে...")
-        brief = "\n".join(f"{lab}: {s[key]}" for lab, key in [("Product name", "name"), ("Description", "desc"), ("Price", "price"), ("Target audience", "audience"), ("Offer", "offer")] if s[key])
+        brief = "\n".join(f"{lab}: {s[key]}" for lab, key in [("Product title (long, from supplier)", "title"), ("Product description", "desc"), ("Target audience", "audience"), ("Offer", "offer"), ("Store name", "brand")] if s[key])
         plan = await asyncio.to_thread(plan_ads, brief, s["photos"])
         m, t = plan["meta"], plan["tiktok"]
+        seo = plan["seo"]
+        await send_text(u, "PRODUCT TITLE (SEO)", ["Title: " + seo["title"], "Alternatives:\n- " + "\n- ".join(seo["alternatives"]), "Meta description: " + seo["meta_description"]])
         await send_text(u, "META (Facebook/Instagram)", [
             "Headlines:\n- " + "\n- ".join(m["headlines"]), "Primary texts:\n\n" + "\n\n".join(m["primary_texts"]),
             "Descriptions:\n- " + "\n- ".join(m["descriptions"]), "CTA button: " + m["cta_button"],
@@ -345,6 +341,9 @@ async def go(u, c):
         s["busy"] = False
         LAST[0] = time.time()
 
+async def on_error(update, context):
+    logging.warning("bot error: %s: %s", type(context.error).__name__, str(context.error)[:200])
+
 class H(BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
     def log_message(self, *a): pass
@@ -360,6 +359,7 @@ def main():
     app.add_handler(CommandHandler("go", go))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo)); app.add_handler(MessageHandler(filters.VIDEO, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 if __name__ == "__main__":
