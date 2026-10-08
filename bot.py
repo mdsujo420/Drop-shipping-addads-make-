@@ -1,4 +1,4 @@
-import time, urllib.request, urllib.parse, os, io, json, wave, glob, random, asyncio, tempfile, subprocess, textwrap, threading, logging
+import base64, time, urllib.request, urllib.parse, os, io, json, wave, glob, random, asyncio, tempfile, subprocess, textwrap, threading, logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -19,22 +19,37 @@ MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.12"))
 VOICES = ["Kore", "Puck", "Charon"]
 IMG_SIZES = {"1x1": (1080, 1080), "4x5": (1080, 1350), "9x16": (1080, 1920), "landscape": (1200, 628)}
 VID_SIZES = {"9x16": (1080, 1920), "4x5": (1080, 1350)}  # add "1x1": (1080, 1080) if you want
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options=types.HttpOptions(timeout=240000))
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options=types.HttpOptions(timeout=150000))
 STATE = {}
 
+def _split(name, default):
+    return [m.strip() for m in (os.getenv(name) or default).split(",") if m.strip()]
+
+FALLBACKS = {
+    TEXT_MODEL: _split("TEXT_FALLBACKS", "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite"),
+    IMAGE_MODEL: _split("IMAGE_FALLBACKS", "gemini-3.1-flash-lite-image"),
+    TTS_MODEL: _split("TTS_FALLBACKS", "gemini-3.8-flash-tts"),
+}
+
 def call(**kw):
-    """Gemini call with automatic retries for temporary errors (503 high demand, 429 per-minute limit)."""
-    delay, tries = 8, 0
-    while True:
-        tries += 1
-        try:
-            return client.models.generate_content(**kw)
-        except Exception as e:
-            code = getattr(e, "code", None)
-            limit = 5 if code in (500, 502, 503, 504) else 3 if code == 429 else 1
-            if tries >= limit: raise
-            logging.warning("Gemini error %s, retry %s/%s in %ss", code, tries, limit, delay)
-            time.sleep(delay); delay = min(delay * 2, 60)
+    """Gemini call: retries temporary errors, then switches to fallback models (busy 503, quota 429, missing 404)."""
+    chain = [kw["model"]] + [m for m in FALLBACKS.get(kw["model"], []) if m != kw["model"]]
+    deadline = time.time() + 420; last = None
+    for mi, model in enumerate(chain):
+        is_last = mi == len(chain) - 1
+        delay = 6
+        for attempt in range(3 if is_last else 2):
+            try:
+                if mi and attempt == 0: logging.warning("using fallback model %s", model)
+                return client.models.generate_content(**{**kw, "model": model})
+            except Exception as e:
+                last = e; code = getattr(e, "code", None)
+                if code not in (404, 429, 500, 502, 503, 504) or time.time() > deadline: raise
+                logging.warning("Gemini %s on %s (attempt %s)", code, model, attempt + 1)
+                if code == 404 or (code == 429 and not is_last): break
+                time.sleep(delay); delay = min(delay * 2, 30)
+    raise last
+
 LAST = [time.time()]
 WARN = []
 IMG_OFF = [False]
@@ -71,14 +86,16 @@ The seller's brief may be in Bengali or another language; translate its meaning,
 Return ONLY JSON with this shape:
 {{"product":str,"cta":str,"seo":{{"title":str,"alternatives":[2 str],"meta_description":str}},
 "images":[5 objects {{"style":str,"prompt":str,"headline":str}}],
-"videos":[{nvid} objects {{"style":str,"voice":str,"captions":[5-6 strings, max 7 words each],"end_card":str}}],
+"videos":[{nvid} objects {{"style":str,"voice":str,"captions":[5-6 strings, max 7 words each],"end_card":str,"scenes":[5-6 objects {{"time":str,"visual":str,"voiceover":str,"text":str}}],"ai_prompt":str}}],
 "meta":{{"headlines":[5 str],"primary_texts":[3 str],"descriptions":[3 str],"cta_button":str,"targeting":[6 str]}},
 "tiktok":{{"captions":[3 str],"hashtags":[8 str],"hooks":[5 str],"on_screen_text":[5 str],"tip":str}}}}
 The 5 image styles must be clearly different from each other and chosen for what suits THIS product
 (e.g. clean studio, lifestyle in use, bold offer banner, UGC-style phone photo, flat-lay).
 Each image prompt must say: keep the product from the reference photo exactly unchanged (shape, color, logo).
 The {nvid} video styles must differ: the first ones are a calm story and a fast promo, any others use a UGC testimonial-style tone.
-Each video "voice" is a 45-60 word spoken script that starts with a strong hook and ends with the CTA."""
+Each video "voice" is a 45-60 word spoken script that starts with a strong hook and ends with the CTA.
+Each video's "scenes" is a shot-by-shot script (time range, what to film or show, the voiceover line, the on-screen text) matching its voice and captions.
+Each "ai_prompt" is one self-contained English prompt (80-120 words) for a text-to-video or image-to-video AI tool: vertical 9:16, 8-10 seconds, the product exactly as in the photos, no dialogue, no price, no brand logos."""
 
 # ---------- image helpers ----------
 def fit_blur(img, w, h):
@@ -129,6 +146,20 @@ def plan_ads(brief, photos, nvid=3):
         config=types.GenerateContentConfig(response_mime_type="application/json"))
     return json.loads(r.text)
 
+SPROMPT = """You are a short-form video director for US social ads.
+Product info:
+{brief}
+The attached photos show the real product.
+Write ONE ready-to-use video script (about 25-30 seconds, vertical 9:16) that a creator can paste into any AI video generator or film themselves.
+Rules: American English; show the product exactly as in the photos; no price or dollar amounts; no medical claims; no fake reviews or fake scarcity; any person shown is an adult (18+).
+Return ONLY JSON: {{"title":str,"total_seconds":int,"music_mood":str,"scenes":[6-8 objects {{"step":int,"time":str (like 0-4s),"visual":str (what we see),"camera":str (angle and movement),"action":str (what the model or product does),"voiceover":str (one spoken line),"on_screen_text":str (max 6 words),"ai_prompt":str (self-contained prompt for ONE 4-8 second AI clip: subject, setting, lighting, camera move, action; no text and no dialogue; says the product stays exactly as in the reference image)}}],"single_prompt":str (one paragraph prompt for a single 8-10 second AI clip),"cta":str (closing line, use the store name if given)}}"""
+
+def plan_script(brief, photos):
+    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:4]]
+    r = call(model=TEXT_MODEL, contents=parts + [SPROMPT.format(brief=brief)],
+             config=types.GenerateContentConfig(response_mime_type="application/json"))
+    return json.loads(r.text)
+
 LPROMPT = """You are an e-commerce SEO specialist for a US online store.
 Seller's product info:
 {brief}
@@ -146,6 +177,8 @@ def plan_listing(brief, photos):
 # ---------- AI model shots (human model photos + AI video clips) ----------
 AI_VIDEO = (os.getenv("AI_VIDEO") or "").strip().lower() in ("1", "true", "yes", "on")
 AI_VIDEO_MODEL = os.getenv("AI_VIDEO_MODEL") or "veo-3.1-generate-preview"
+AI_ENGINE = (os.getenv("AI_VIDEO_ENGINE") or "omni").strip().lower()   # "omni" (Gemini Omni Flash) or "veo"
+AI_OMNI_MODEL = os.getenv("AI_OMNI_MODEL") or "gemini-omni-1.1-flash"
 
 MPROMPT = """You are a creative director for US social media ads.
 Product info:
@@ -194,6 +227,32 @@ def ai_clip(prompt, frame_bytes, out):
         client.files.download(file=v.video, destination=str(out))
     return out
 
+def omni_clip(prompt, frame_bytes, out):
+    """Image-to-video with Gemini Omni Flash (Interactions API)."""
+    im = fit_blur(Image.open(io.BytesIO(frame_bytes)), 720, 1280)
+    buf = io.BytesIO(); im.save(buf, "JPEG", quality=92)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    text = ("<FIRST_FRAME> " + prompt + " One continuous shot, no scene cuts, about 8 seconds. No dialogue, no on-screen text. "
+            "Keep the product exactly as in the image.")
+    delay = 8
+    for attempt in range(3):
+        try:
+            it = client.interactions.create(
+                model=AI_OMNI_MODEL,
+                input=[{"type": "image", "data": b64, "mime_type": "image/jpeg"}, {"type": "text", "text": text}],
+                response_format={"type": "video", "aspect_ratio": "9:16"})
+            break
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code not in (429, 500, 502, 503, 504) or attempt == 2: raise
+            time.sleep(delay); delay *= 2
+    vid = it.output_video
+    if getattr(vid, "data", None):
+        Path(out).write_bytes(base64.b64decode(vid.data))
+    else:
+        client.files.download(file=vid.uri, destination=str(out))
+    return out
+
 def finish_clip(clip, cta, tmp, idx):
     tmp = Path(tmp)
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(clip)],
@@ -215,7 +274,8 @@ def finish_clip(clip, cta, tmp, idx):
     return outs
 
 def make_ai_video(i, shot, frame, cta, tmp):
-    clip = ai_clip(shot["video_prompt"], frame, Path(tmp) / f"aiclip{i}.mp4")
+    maker = omni_clip if AI_ENGINE == "omni" else ai_clip
+    clip = maker(shot["video_prompt"], frame, Path(tmp) / f"aiclip{i}.mp4")
     return finish_clip(clip, cta, tmp, i)
 
 def make_images(plan, photos, tmp):
@@ -354,7 +414,8 @@ async def ask(u, s):
         "নিচের বোতাম থেকে বেছে নিন।\n"
         "• AI মডেল ON: মডেলের AI ছবি ও AI ভিডিও (Veo) যোগ হবে। এতে খরচ বেশি।\n"
         "• AI মডেল OFF: শুধু আপনার ছবি-ভিডিও থেকে অ্যাড হবে।\n"
-        "• 🚀 সব: বিজ্ঞাপন কিট ও লিস্টিং দুটোই।\n\n"
+        "• 🚀 সব: বিজ্ঞাপন কিট ও লিস্টিং দুটোই।\n"
+        "• বিজ্ঞাপন কিটে ভিডিও স্ক্রিপ্ট সেকশনও থাকবে (যেকোনো AI ভিডিও সাইটে ব্যবহারের জন্য)।\n\n"
         "নতুন করে শুরু করতে /new।", reply_markup=keyboard(s))
 
 def keyboard(s):
@@ -363,7 +424,7 @@ def keyboard(s):
         [InlineKeyboardButton(("✅ " if on else "") + "AI মডেল ON", callback_data="ai1"),
          InlineKeyboardButton(("✅ " if not on else "") + "AI মডেল OFF", callback_data="ai0")],
         [InlineKeyboardButton("🎬 বিজ্ঞাপন কিট", callback_data="ads"), InlineKeyboardButton("📝 লিস্টিং", callback_data="lst")],
-        [InlineKeyboardButton("🚀 সব বানাও (কিট + লিস্টিং)", callback_data="all")]])
+        [InlineKeyboardButton("🚀 সব বানাও (কিট + লিস্টিং)", callback_data="all")],])
 
 class Shim:
     """Lets button presses reuse the same handlers as typed commands."""
@@ -427,7 +488,7 @@ async def on_video(u, c):
         return await u.message.reply_text("এখন ভিডিওর ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন।")
     if len(s["videos"]) >= 6: return
     try:
-        f = await u.message.video.get_file()
+        f = await (u.message.video or u.message.document).get_file()
         p = Path(tempfile.mkdtemp()) / "user.mp4"; await f.download_to_drive(p); s["videos"].append(p)
     except Exception:
         return await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে আবার পাঠান।")
@@ -477,6 +538,29 @@ async def send_listing(u, L, s):
              for i in range(min(len(s["photos"]), 10))]
     if group: await u.message.reply_media_group(group, caption="SEO ফাইলনামসহ ছবি (alt text JSON ফাইলে আছে)", write_timeout=300)
 
+def script_blocks(plan):
+    blocks = []
+    for i, v in enumerate(plan.get("videos", [])):
+        lines = [f"VIDEO {i+1}: {v.get('style', '')}", "Scenes:"]
+        for sc in v.get("scenes", []):
+            lines.append(f"[{sc.get('time', '')}] Visual: {sc.get('visual', '')} | Voiceover: {sc.get('voiceover', '')} | On-screen text: {sc.get('text', '')}")
+        lines += [f"End card: {v.get('end_card', '')}", "", "Full voiceover:", str(v.get("voice", "")), "",
+                  "AI video prompt (paste into any text-to-video or image-to-video tool):", str(v.get("ai_prompt", ""))]
+        blocks.append("\n".join(lines))
+    return blocks
+
+async def send_script(u, sc):
+    head = f"{sc.get('title', 'Video script')} (about {sc.get('total_seconds', 30)} sec, 9:16)\nMusic mood: {sc.get('music_mood', '')}"
+    blocks = [head]
+    for sn in sc.get("scenes", []):
+        blocks.append(f"STEP {sn.get('step')} ({sn.get('time')})\nVisual: {sn.get('visual')}\nCamera: {sn.get('camera')}\nAction: {sn.get('action')}\n"
+                      f"Voiceover: {sn.get('voiceover')}\nOn-screen text: {sn.get('on_screen_text')}\nAI prompt: {sn.get('ai_prompt')}")
+    blocks.append("SINGLE PROMPT (one clip):\n" + str(sc.get("single_prompt", "")))
+    blocks.append("CTA: " + str(sc.get("cta", "")))
+    await send_text(u, "🎬 VIDEO SCRIPT", blocks)
+    await u.message.reply_document(document=("\n\n".join(blocks)).encode(), filename="video-script.txt",
+                                   caption="স্ক্রিপ্ট ফাইল: যেকোনো AI ভিডিও সাইটে ব্যবহার করুন")
+
 async def do_ads(u, s, brief, tmp):
     vids = s["videos"]; n_ugc = min(len(vids), 3); n_photo = 2 if n_ugc else 3
     groups = [vids[k::n_ugc] for k in range(n_ugc)]
@@ -491,6 +575,17 @@ async def do_ads(u, s, brief, tmp):
     await send_text(u, "TIKTOK", [
         "Captions:\n- " + "\n- ".join(t["captions"]), "Hashtags: " + " ".join(t["hashtags"]),
         "Hooks:\n- " + "\n- ".join(t["hooks"]), "On-screen text:\n- " + "\n- ".join(t["on_screen_text"]), "Tip: " + t["tip"]])
+    try:
+        sc = await asyncio.to_thread(plan_script, brief, s["photos"])
+        await send_script(u, sc)
+    except Exception as e:
+        logging.exception("script failed")
+        await u.message.reply_text(f"⚠ স্ক্রিপ্ট তৈরি হয়নি: {type(e).__name__}: {str(e)[:200]}")
+    blocks = script_blocks(plan)
+    if blocks:
+        await send_text(u, "VIDEO SCRIPTS", blocks)
+        await u.message.reply_document(document=("\n\n" + "=" * 30 + "\n\n").join(blocks).encode(), filename="video-scripts.txt",
+                                       caption="স্ক্রিপ্ট ফাইল: পরে যেকোনো AI ভিডিও সাইটে ব্যবহার করতে পারবেন")
     await u.message.reply_text("৫টি ছবি তৈরি হচ্ছে (প্রতিটি ৪ সাইজে)...")
     bases, files = await asyncio.to_thread(make_images, plan, s["photos"], tmp)
     for style, group in files:
@@ -515,6 +610,7 @@ async def do_models(u, s, brief, tmp):
     n = int(os.getenv("MODEL_SHOTS") or 3)
     await u.message.reply_text("AI মডেল শটের পরিকল্পনা তৈরি হচ্ছে...")
     shots = (await asyncio.to_thread(plan_models, brief, s["photos"], n))["shots"][:n]
+    await send_text(u, "AI MODEL SHOT SCRIPTS", [f"SHOT {i+1}: {sh.get('scene', '')}\nVideo prompt:\n{sh.get('video_prompt', '')}\n\nImage prompt:\n{sh.get('image_prompt', '')}" for i, sh in enumerate(shots)])
     await u.message.reply_text(f"AI মডেল ছবি তৈরি হচ্ছে ({len(shots)}টি, প্রতিটি ৩ সাইজে)...")
     res = await asyncio.to_thread(model_photos, shots, s["photos"], tmp)
     for scene, raw, paths in res:
@@ -588,7 +684,7 @@ def main():
     app = Application.builder().token(TOKEN).concurrent_updates(True).read_timeout(120).write_timeout(300).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("go", go)); app.add_handler(CommandHandler("listing", listing_cmd)); app.add_handler(CommandHandler("all", all_cmd)); app.add_handler(CommandHandler("model", model_cmd)); app.add_handler(CommandHandler("ai", ai_cmd)); app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo)); app.add_handler(MessageHandler(filters.VIDEO, on_video))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo)); app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     app.run_polling()
