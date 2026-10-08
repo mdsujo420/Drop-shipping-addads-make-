@@ -21,6 +21,20 @@ IMG_SIZES = {"1x1": (1080, 1080), "4x5": (1080, 1350), "9x16": (1080, 1920), "la
 VID_SIZES = {"9x16": (1080, 1920), "4x5": (1080, 1350)}  # add "1x1": (1080, 1080) if you want
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options=types.HttpOptions(timeout=240000))
 STATE = {}
+
+def call(**kw):
+    """Gemini call with automatic retries for temporary errors (503 high demand, 429 per-minute limit)."""
+    delay, tries = 8, 0
+    while True:
+        tries += 1
+        try:
+            return client.models.generate_content(**kw)
+        except Exception as e:
+            code = getattr(e, "code", None)
+            limit = 5 if code in (500, 502, 503, 504) else 3 if code == 429 else 1
+            if tries >= limit: raise
+            logging.warning("Gemini error %s, retry %s/%s in %ss", code, tries, limit, delay)
+            time.sleep(delay); delay = min(delay * 2, 60)
 LAST = [time.time()]
 WARN = []
 
@@ -92,7 +106,7 @@ def caption(img, text, pos=0.75, size=None):
 
 def gen_image(prompt, photo):
     try:
-        r = client.models.generate_content(
+        r = call(
             model=IMAGE_MODEL,
             contents=[prompt, types.Part.from_bytes(data=photo, mime_type="image/jpeg")],
             config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]))
@@ -107,7 +121,7 @@ def gen_image(prompt, photo):
 # ---------- pipeline steps (sync, run in threads) ----------
 def plan_ads(brief, photos):
     parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:3]]
-    r = client.models.generate_content(
+    r = call(
         model=TEXT_MODEL, contents=parts + [PROMPT.format(brief=brief)],
         config=types.GenerateContentConfig(response_mime_type="application/json"))
     return json.loads(r.text)
@@ -129,7 +143,7 @@ def make_images(plan, photos, tmp):
 
 def tts(text, voice, path):
     try:
-        r = client.models.generate_content(
+        r = call(
             model=TTS_MODEL, contents=text,
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
