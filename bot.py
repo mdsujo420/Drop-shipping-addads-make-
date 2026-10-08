@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-2.5-flash")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-2.5-flash-image")
-TTS_MODEL = os.getenv("TTS_MODEL", "gemini-2.5-flash-preview-tts")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-3.8-flash")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
+TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-lite-tts")
 FONT = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.12"))
 VOICES = ["Kore", "Puck", "Charon"]
@@ -22,6 +22,7 @@ VID_SIZES = {"9x16": (1080, 1920), "4x5": (1080, 1350)}  # add "1x1": (1080, 108
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 STATE = {}
 LAST = [time.time()]
+WARN = []
 
 def notify(text):
     for uid in ALLOWED:
@@ -98,6 +99,7 @@ def gen_image(prompt, photo):
                 return p.inline_data.data
     except Exception as e:
         logging.warning("image gen failed: %s", e)
+        WARN.append(f"ছবির মডেল ({IMAGE_MODEL}) কাজ করেনি, আসল ছবি ব্যবহার হয়েছে: {type(e).__name__}: {str(e)[:250]}")
     return None
 
 # ---------- pipeline steps (sync, run in threads) ----------
@@ -137,6 +139,7 @@ def tts(text, voice, path):
         return len(pcm) / 2 / 24000
     except Exception as e:
         logging.warning("tts failed: %s", e)
+        WARN.append(f"ভয়েস মডেল ({TTS_MODEL}) কাজ করেনি, ভিডিওতে ভয়েস নেই: {type(e).__name__}: {str(e)[:250]}")
         return None
 
 def run(cmd):
@@ -214,42 +217,85 @@ async def guard(u: Update):
         return False
     return True
 
+Q = {
+    "name": "ধাপ ১/৭: প্রোডাক্টের নাম লিখুন।\nযেমন: Rechargeable Hand Warmer\n(ইংরেজিতে লিখলে ভালো, বিজ্ঞাপনে এই নামই ব্যবহার হবে।)",
+    "desc": "ধাপ ২/৭: প্রোডাক্টের বর্ণনা লিখুন (৩–৫ লাইন)।\nলিখবেন: এটা কী কাজ করে, কার কোন সমস্যা মেটায়, বিশেষত্ব কী (ব্যাটারি, সাইজ, ম্যাটেরিয়াল, কয়টা মোড ইত্যাদি)।\nসত্যি তথ্যই লিখবেন। বাড়িয়ে বা মিথ্যা কিছু লিখলে বিজ্ঞাপনেও সেটাই যাবে, তাতে অ্যাড বন্ধ হতে পারে।\nবাংলায় লিখলেও চলবে, বিজ্ঞাপন ইংরেজিতে হবে।",
+    "price": "ধাপ ৩/৭: বিক্রয় মূল্য ডলারে লিখুন।\nযেমন: $29.99\nকম্বো বা অফার দাম থাকলে সেটাও লিখুন, যেমন: 1 for $29.99, 2 for $49.99",
+    "audience": "ধাপ ৪/৭: কাদের কাছে বেচবেন?\nযেমন: ঠান্ডা এলাকার কর্মজীবী মানুষ, প্রিয়জনকে গিফট দিতে চান এমন ক্রেতা, ২৫–৪৫ বছরের মহিলা।\nঠিক না জানলে skip লিখুন, আমি প্রোডাক্ট দেখে অনুমান করব।",
+    "offer": "ধাপ ৫/৭: কোনো অফার আছে? (ঐচ্ছিক)\nযেমন: Free shipping, 20% off today, Buy 2 Get 1 Free\nঅফার না থাকলে skip লিখুন। (শুধু সত্যিকারের অফার লিখুন।)",
+    "photos": "ধাপ ৬/৭: প্রোডাক্টের ছবি পাঠান (১–৩টি)।\nভালো ছবি: পরিষ্কার, প্রোডাক্ট পুরোটা দেখা যায়, ঝাপসা না, ওয়াটারমার্ক ছাড়া। ভিন্ন কোণ থেকে নিলে ভালো।\nএকটা একটা করে পাঠান। সব পাঠানো হলে done লিখুন (৩টি দিলে নিজে থেকেই পরের ধাপে যাবে)।",
+    "video": "ধাপ ৭/৭: প্রোডাক্টের ছোট ভিডিও পাঠান (ঐচ্ছিক)।\n১৫–৩০ সেকেন্ড, ২০MB-এর নিচে, প্রোডাক্ট ব্যবহার করে দেখানো হলে সবচেয়ে ভালো।\nএটা দিলে তৃতীয় ভিডিওটা আপনার ভিডিও কেটে বানানো হবে। না থাকলে skip লিখুন।",
+}
+ORDER = ["name", "desc", "price", "audience", "offer", "photos", "video", "confirm"]
+
+def advance(s): s["step"] = ORDER[ORDER.index(s["step"]) + 1]
+
+async def ask(u, s):
+    if s["step"] != "confirm":
+        return await u.message.reply_text(Q[s["step"]])
+    await u.message.reply_text(
+        "সব তথ্য পেয়েছি:\n"
+        f"• নাম: {s['name']}\n• দাম: {s['price']}\n• অডিয়েন্স: {s['audience'] or 'অনুমান করা হবে'}\n"
+        f"• অফার: {s['offer'] or 'নেই'}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: {'আছে' if s['video'] else 'নেই'}\n\n"
+        "সব ঠিক থাকলে /go লিখুন। নতুন করে শুরু করতে /new।")
+
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await guard(u): return
-    await u.message.reply_text("/new দিয়ে শুরু করুন। তারপর ১–৩টি প্রোডাক্ট ছবি, ঐচ্ছিক একটি ছোট ভিডিও (২০MB-এর নিচে), "
-                               "আর প্রোডাক্টের নাম, বর্ণনা, দাম, অডিয়েন্স লিখে পাঠান। শেষে /go।")
+    await u.message.reply_text("শুরু করতে /new লিখুন। আমি এক এক করে প্রশ্ন করব, আপনি শুধু উত্তর দেবেন।")
 
 async def new(u, c):
     if not await guard(u): return
-    STATE[u.effective_chat.id] = {"photos": [], "video": None, "text": [], "busy": False}
-    await u.message.reply_text("নতুন প্রোডাক্ট শুরু। ছবি, লেখা পাঠান, তারপর /go।")
+    s = STATE[u.effective_chat.id] = {"step": "name", "photos": [], "video": None, "busy": False,
+                                      "name": "", "desc": "", "price": "", "audience": "", "offer": ""}
+    await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ।")
+    await ask(u, s)
 
 def st(u): return STATE.get(u.effective_chat.id)
 
 async def on_photo(u, c):
     if not await guard(u): return
     s = st(u)
-    if not s: return await u.message.reply_text("আগে /new দিন।")
-    if len(s["photos"]) < 3:
-        f = await u.message.photo[-1].get_file(); s["photos"].append(bytes(await f.download_as_bytearray()))
-    if u.message.caption: s["text"].append(u.message.caption)
-    await u.message.reply_text(f"ছবি: {len(s['photos'])}/৩")
+    if not s or s["step"] != "photos":
+        return await u.message.reply_text("এখন ছবির ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন, বা /new দিয়ে নতুন করে শুরু করুন।")
+    if len(s["photos"]) >= 3:
+        return await u.message.reply_text("৩টি ছবি হয়ে গেছে। done লিখুন।")
+    f = await u.message.photo[-1].get_file(); s["photos"].append(bytes(await f.download_as_bytearray()))
+    n = len(s["photos"])
+    if n >= 3:
+        await u.message.reply_text("ছবি ৩/৩ পেয়েছি।"); advance(s); await ask(u, s)
+    else:
+        await u.message.reply_text(f"ছবি {n}/৩ পেয়েছি। আরও পাঠান, অথবা done লিখুন।")
 
 async def on_video(u, c):
     if not await guard(u): return
     s = st(u)
-    if not s: return await u.message.reply_text("আগে /new দিন।")
+    if not s or s["step"] != "video":
+        return await u.message.reply_text("এখন ভিডিওর ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন।")
     try:
         f = await u.message.video.get_file()
         p = Path(tempfile.mkdtemp()) / "user.mp4"; await f.download_to_drive(p); s["video"] = p
-        await u.message.reply_text("ভিডিও পেয়েছি।")
     except Exception:
-        await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে পাঠান।")
+        return await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে পাঠান, অথবা skip লিখুন।")
+    await u.message.reply_text("ভিডিও পেয়েছি।"); advance(s); await ask(u, s)
 
 async def on_text(u, c):
     if not await guard(u): return
     s = st(u)
-    if s: s["text"].append(u.message.text); await u.message.reply_text("লেখা সেভ হয়েছে।")
+    if not s: return await u.message.reply_text("শুরু করতে /new লিখুন।")
+    k, t = s["step"], u.message.text.strip()
+    low = t.lower()
+    if k in ("name", "desc", "price"):
+        s[k] = t
+    elif k in ("audience", "offer"):
+        s[k] = "" if low == "skip" else t
+    elif k == "photos":
+        if low != "done": return await u.message.reply_text("ছবি পাঠান। সব ছবি পাঠানো হলে done লিখুন।")
+        if not s["photos"]: return await u.message.reply_text("কমপক্ষে ১টি ছবি লাগবে। ছবি পাঠান।")
+    elif k == "video":
+        if low != "skip": return await u.message.reply_text("ভিডিও পাঠান, অথবা skip লিখুন।")
+    else:
+        return await u.message.reply_text("সব তথ্য জমা হয়েছে। শুরু করতে /go, নতুন করে শুরু করতে /new।")
+    advance(s); await ask(u, s)
 
 async def send_text(u, title, blocks):
     txt = title + "\n\n" + "\n\n".join(blocks)
@@ -258,13 +304,14 @@ async def send_text(u, title, blocks):
 async def go(u, c):
     if not await guard(u): return
     s = st(u)
-    if not s or not s["photos"] or not s["text"]: return await u.message.reply_text("কমপক্ষে ১টি ছবি ও প্রোডাক্টের বর্ণনা লাগবে।")
+    if not s or not s["photos"] or not s["name"] or not s["desc"]: return await u.message.reply_text("আগে /new দিয়ে সব ধাপের উত্তর দিন।")
     if s["busy"]: return await u.message.reply_text("আগের কাজ চলছে।")
     s["busy"] = True
     try:
         tmp = tempfile.mkdtemp()
         await u.message.reply_text("পরিকল্পনা তৈরি হচ্ছে...")
-        plan = await asyncio.to_thread(plan_ads, "\n".join(s["text"]), s["photos"])
+        brief = "\n".join(f"{lab}: {s[key]}" for lab, key in [("Product name", "name"), ("Description", "desc"), ("Price", "price"), ("Target audience", "audience"), ("Offer", "offer")] if s[key])
+        plan = await asyncio.to_thread(plan_ads, brief, s["photos"])
         m, t = plan["meta"], plan["tiktok"]
         await send_text(u, "META (Facebook/Instagram)", [
             "Headlines:\n- " + "\n- ".join(m["headlines"]), "Primary texts:\n\n" + "\n\n".join(m["primary_texts"]),
@@ -278,10 +325,14 @@ async def go(u, c):
         for style, group in files:
             await u.message.reply_media_group([InputMediaDocument(open(p, "rb"), caption=(style if i == 0 else None))
                                                for i, p in enumerate(group)], write_timeout=300)
+        for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
+        WARN.clear()
         pool = [Image.open(io.BytesIO(b)) for b in bases] + [Image.open(io.BytesIO(b)) for b in s["photos"]]
         for idx, vp in enumerate(plan["videos"][:3]):
             await u.message.reply_text(f"ভিডিও {idx+1}/৩ তৈরি হচ্ছে: {vp['style']}")
             outs = await asyncio.to_thread(make_video, idx, vp, pool, s["video"], tmp)
+            for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
+            WARN.clear()
             for path, W, H in outs:
                 with open(path, "rb") as fh:
                     await u.message.reply_video(fh, width=W, height=H, supports_streaming=True,
