@@ -22,3 +22,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           IDLE_MINUTES: ${{ inputs.idle_minutes }}
+          AI_VIDEO: ${{ vars.AI_VIDEO }}
+          AI_VIDEO_MODEL: ${{ vars.AI_VIDEO_MODEL }}
+          AI_VIDEO_CLIPS: ${{ vars.AI_VIDEO_CLIPS }}
+          MODEL_SHOTS: ${{ vars.MODEL_SHOTS }}
