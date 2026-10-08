@@ -37,6 +37,7 @@ def call(**kw):
             time.sleep(delay); delay = min(delay * 2, 60)
 LAST = [time.time()]
 WARN = []
+IMG_OFF = [False]
 
 def notify(text):
     for uid in ALLOWED:
@@ -70,13 +71,13 @@ The seller's brief may be in Bengali or another language; translate its meaning,
 Return ONLY JSON with this shape:
 {{"product":str,"cta":str,"seo":{{"title":str,"alternatives":[2 str],"meta_description":str}},
 "images":[5 objects {{"style":str,"prompt":str,"headline":str}}],
-"videos":[3 objects {{"style":str,"voice":str,"captions":[5-6 strings, max 7 words each],"end_card":str}}],
+"videos":[{nvid} objects {{"style":str,"voice":str,"captions":[5-6 strings, max 7 words each],"end_card":str}}],
 "meta":{{"headlines":[5 str],"primary_texts":[3 str],"descriptions":[3 str],"cta_button":str,"targeting":[6 str]}},
 "tiktok":{{"captions":[3 str],"hashtags":[8 str],"hooks":[5 str],"on_screen_text":[5 str],"tip":str}}}}
 The 5 image styles must be clearly different from each other and chosen for what suits THIS product
 (e.g. clean studio, lifestyle in use, bold offer banner, UGC-style phone photo, flat-lay).
 Each image prompt must say: keep the product from the reference photo exactly unchanged (shape, color, logo).
-The 3 video styles must differ (e.g. calm story, fast promo, UGC testimonial-style tone).
+The {nvid} video styles must differ: the first ones are a calm story and a fast promo, any others use a UGC testimonial-style tone.
 Each video "voice" is a 45-60 word spoken script that starts with a strong hook and ends with the CTA."""
 
 # ---------- image helpers ----------
@@ -105,6 +106,7 @@ def caption(img, text, pos=0.75, size=None):
     return img
 
 def gen_image(prompt, photo):
+    if IMG_OFF[0]: return None
     try:
         r = call(
             model=IMAGE_MODEL,
@@ -115,15 +117,30 @@ def gen_image(prompt, photo):
                 return p.inline_data.data
     except Exception as e:
         logging.warning("image gen failed: %s", e)
+        if getattr(e, "code", None) == 429: IMG_OFF[0] = True
         WARN.append(f"ছবির মডেল ({IMAGE_MODEL}) কাজ করেনি, আসল ছবি ব্যবহার হয়েছে: {type(e).__name__}: {str(e)[:250]}")
     return None
 
 # ---------- pipeline steps (sync, run in threads) ----------
-def plan_ads(brief, photos):
-    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:3]]
+def plan_ads(brief, photos, nvid=3):
+    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:4]]
     r = call(
-        model=TEXT_MODEL, contents=parts + [PROMPT.format(brief=brief)],
+        model=TEXT_MODEL, contents=parts + [PROMPT.format(brief=brief, nvid=nvid)],
         config=types.GenerateContentConfig(response_mime_type="application/json"))
+    return json.loads(r.text)
+
+LPROMPT = """You are an e-commerce SEO specialist for a US online store.
+Seller's product info:
+{brief}
+The attached photos ({n} in total) show the real product.
+Rules: American English only; use only facts present in the seller's info or visible in the photos; never invent specs, materials, certifications or numbers; no medical claims; no fake reviews; never mention a price.
+The seller's title and description are long and supplier-written: rewrite them cleanly.
+Return ONLY JSON: {{"seo_title":str (max 60 chars, main keyword first, natural),"short_title":str (max 40 chars),"slug":str (lowercase-hyphens, max 5 words),"focus_keyword":str,"meta_title":str (max 60 chars),"meta_description":str (max 155 chars, includes the focus keyword),"keywords":[10 str],"tags":[15 str],"categories":[3 str],"short_description":str (40-60 words),"bullets":[6 str],"long_description_html":str (HTML using only h2, p, ul, li; 200-350 words; focus keyword used naturally 2-3 times),"specs":[objects {{"name":str,"value":str}} only for facts that are given],"faq":[5 objects {{"q":str,"a":str}}],"image_alts":[{n} str, one per photo, descriptive, under 125 chars],"image_filenames":[{n} str, lowercase-hyphenated .jpg names]}}"""
+
+def plan_listing(brief, photos):
+    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:10]]
+    r = call(model=TEXT_MODEL, contents=parts + [LPROMPT.format(brief=brief, n=len(photos))],
+             config=types.GenerateContentConfig(response_mime_type="application/json"))
     return json.loads(r.text)
 
 def make_images(plan, photos, tmp):
@@ -180,19 +197,25 @@ def mux(video, wav, out, dur):
         cmd += ["-stream_loop", "-1", "-i", random.choice(music), "-af", f"volume=0.5,afade=t=out:st={max(dur-1.5,0):.2f}:d=1.5", "-map", "0:v", "-map", "1:a"]
     run(cmd + ["-t", f"{dur:.2f}", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)])
 
-def ugc_video(uvid, caps, dur, wh, tmp, out):
-    W, H = wh; per = dur / len(caps); cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(uvid)]
+def ugc_video(clips, caps, dur, wh, tmp, out):
+    W, H = wh; N = len(clips); share = dur / N; per = dur / len(caps)
+    cmd = ["ffmpeg", "-y"]
+    for p in clips: cmd += ["-stream_loop", "-1", "-i", str(p)]
+    f = ""
+    for i in range(N):
+        f += (f"[{i}:v]trim=duration={share:.2f},setpts=PTS-STARTPTS,fps=30,split[a{i}][b{i}];"
+              f"[a{i}]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=25:5[bg{i}];"
+              f"[b{i}]scale={W}:{H}:force_original_aspect_ratio=decrease[fg{i}];"
+              f"[bg{i}][fg{i}]overlay=(W-w)/2:(H-h)/2,setsar=1[c{i}];")
+    f += "".join(f"[c{i}]" for i in range(N)) + f"concat=n={N}:v=1:a=0[v0]"
     for i, c in enumerate(caps):
         p = Path(tmp) / f"cap{i}_{W}.png"
         caption(Image.new("RGBA", (W, H), (0, 0, 0, 0)), c, 0.78).save(p); cmd += ["-i", str(p)]
-    f = (f"[0:v]split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=25:5[bg];"
-         f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]")
-    for i in range(len(caps)):
-        f += f";[v{i}][{i+1}:v]overlay=0:0:enable='between(t,{i*per:.2f},{(i+1)*per:.2f})'[v{i+1}]"
+        f += f";[v{i}][{N+i}:v]overlay=0:0:enable='between(t,{i*per:.2f},{(i+1)*per:.2f})'[v{i+1}]"
     run(cmd + ["-filter_complex", f, "-map", f"[v{len(caps)}]", "-t", f"{dur:.2f}", "-r", "30", "-pix_fmt", "yuv420p",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-an", str(out)])
 
-def make_video(idx, vp, pool, uvid, tmp):
+def make_video(idx, vp, pool, clips, tmp):
     tmp = Path(tmp); caps = vp["captions"][:6]
     wav = tmp / f"voice{idx}.wav"
     dur = tts(vp["voice"], VOICES[idx % 3], wav)
@@ -201,8 +224,8 @@ def make_video(idx, vp, pool, uvid, tmp):
     outs = []
     for key, wh in VID_SIZES.items():
         W, H = wh; joined = tmp / f"j{idx}_{key}.mp4"; final = tmp / f"video{idx+1}_{key}.mp4"
-        if idx == 2 and uvid:
-            ugc_video(uvid, caps, dur, wh, tmp, joined); total = dur
+        if clips:
+            ugc_video(clips, caps, dur, wh, tmp, joined); total = dur
         else:
             k = 2 if idx == 1 else 1; d = dur / len(caps) / k; segs = []
             for i, c in enumerate(caps):
@@ -234,10 +257,10 @@ async def guard(u: Update):
     return True
 
 Q = {
-    "photos": "ধাপ ১/৭: প্রোডাক্টের ৩টি ছবি পাঠান (বাধ্যতামূলক)।\nভালো ছবি: পরিষ্কার, প্রোডাক্ট পুরোটা দেখা যায়, ঝাপসা না, ওয়াটারমার্ক ছাড়া, ভিন্ন ভিন্ন কোণ থেকে তোলা।\nএকটা একটা করে পাঠান। ৩টি হলে নিজে থেকেই পরের ধাপে যাব।",
-    "video": "ধাপ ২/৭: প্রোডাক্টের একটি ছোট ভিডিও পাঠান (বাধ্যতামূলক)।\n১৫–৩০ সেকেন্ড, প্রোডাক্ট ব্যবহার করে দেখানো হলে সবচেয়ে ভালো।\nএই ভিডিও কেটেই একটি অ্যাড ভিডিও বানানো হবে।\nসাইজ ২০MB-এর নিচে রাখুন, এর বেশি হলে বট নামাতে পারে না।",
+    "photos": "ধাপ ১/৭: প্রোডাক্টের ছবি পাঠান (বাধ্যতামূলক, ১ থেকে ১০টি, যতগুলো খুশি)।\nভালো ছবি: পরিষ্কার, প্রোডাক্ট পুরোটা দেখা যায়, ঝাপসা না, ওয়াটারমার্ক ছাড়া, ভিন্ন ভিন্ন কোণ থেকে তোলা।\nএকটা একটা করে পাঠান। সব পাঠানো হলে done লিখুন (১০টি হলে নিজে থেকেই পরের ধাপে যাব)।",
+    "video": "ধাপ ২/৭: প্রোডাক্টের ভিডিও পাঠান (ঐচ্ছিক, ১ থেকে ৬টি)।\nপ্রতিটি ২০MB-এর নিচে, প্রোডাক্ট ব্যবহার করে দেখানো হলে সবচেয়ে ভালো।\nভিডিও দিলে সেগুলো কেটে অ্যাড ভিডিও বানানো হবে (সর্বোচ্চ ৩টি অ্যাড; ৩টির বেশি ক্লিপ দিলে ভাগ করে ব্যবহার হবে)।\nশুধু লিস্টিং চাইলে বা ভিডিও না থাকলে skip লিখুন। সব পাঠানো হলে done লিখুন।",
     "title": "ধাপ ৩/৭: প্রোডাক্টের টাইটেল লিখুন (বাধ্যতামূলক)।\nসাপ্লায়ারের লম্বা টাইটেল হুবহু পেস্ট করলেও চলবে। আমি সেটাকে ছোট ও SEO-ফ্রেন্ডলি করে দেব।",
-    "desc": "ধাপ ৪/৭: প্রোডাক্টের ডেসক্রিপশন দিন (বাধ্যতামূলক)।\nসাপ্লায়ারের ডেসক্রিপশন পেস্ট করলেও হবে, বাংলায় বা ইংরেজিতে।\nএর ভিত্তিতেই অ্যাড, ভিডিও আর সব টেক্সট বানানো হবে। শুধু সত্যি তথ্য থাকলে ভালো, বাড়িয়ে বলা দাবি থাকলে অ্যাড বন্ধ হতে পারে।",
+    "desc": "ধাপ ৪/৭: প্রোডাক্টের ডেসক্রিপশন দিন (বাধ্যতামূলক)।\nসাপ্লায়ারের লম্বা ডেসক্রিপশন পেস্ট করলেও হবে, বাংলায় বা ইংরেজিতে।\nএর ভিত্তিতেই অ্যাড, লিস্টিং আর সব টেক্সট বানানো হবে। শুধু সত্যি তথ্য থাকলে ভালো, বাড়িয়ে বলা দাবি থাকলে অ্যাড বন্ধ হতে পারে।",
     "audience": "ধাপ ৫/৭: (ঐচ্ছিক) কাদের কাছে বেচবেন?\nযেমন: গিফট খুঁজছেন এমন মানুষ, বাচ্চাদের মা-বাবা, ২৫–৪৫ বছরের মহিলা।\nনা জানলে skip লিখুন, আমি প্রোডাক্ট দেখে অনুমান করব।",
     "offer": "ধাপ ৬/৭: (ঐচ্ছিক) কোনো অফার আছে?\nযেমন: Free shipping, 20% off today, Buy 2 Get 1 Free।\nদামের সংখ্যা অ্যাডে দেখানো হবে না, কারণ ক্রেতা আপনার ওয়েবসাইট থেকে কিনবে। শুধু সত্যিকারের অফার লিখুন। না থাকলে skip।",
     "brand": "ধাপ ৭/৭: (ঐচ্ছিক) আপনার স্টোরের নাম লিখুন, যেমন: CozyNest।\nভিডিও ও ছবির শেষে \"Shop now at CozyNest\" ধাঁচের CTA আসবে। না থাকলে skip।",
@@ -251,9 +274,10 @@ async def ask(u, s):
         return await u.message.reply_text(Q[s["step"]])
     await u.message.reply_text(
         "সব তথ্য পেয়েছি:\n"
-        f"• টাইটেল: {s['title'][:120]}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: আছে\n"
+        f"• টাইটেল: {s['title'][:120]}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: {len(s['videos'])}টি\n"
         f"• অডিয়েন্স: {s['audience'] or 'অনুমান করা হবে'}\n• অফার: {s['offer'] or 'নেই'}\n• স্টোর: {s['brand'] or 'নেই'}\n\n"
-        "সব ঠিক থাকলে /go লিখুন। নতুন করে শুরু করতে /new।")
+        "এখন কোনটা বানাবো?\n/go : বিজ্ঞাপন কিট (ছবি, ভিডিও, Meta ও TikTok টেক্সট)\n"
+        "/listing : প্রোডাক্ট লিস্টিং (SEO টাইটেল, ডেসক্রিপশন, ট্যাগ, FAQ)\n/all : দুটোই\n\nনতুন করে শুরু করতে /new।")
 
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await guard(u): return
@@ -261,9 +285,9 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def new(u, c):
     if not await guard(u): return
-    s = STATE[u.effective_chat.id] = {"step": "photos", "photos": [], "video": None, "busy": False,
+    s = STATE[u.effective_chat.id] = {"step": "photos", "photos": [], "videos": [], "busy": False,
                                       "title": "", "desc": "", "audience": "", "offer": "", "brand": ""}
-    await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ: প্রথম ৪টি বাধ্যতামূলক, শেষ ৩টি ঐচ্ছিক।")
+    await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ: ছবি, টাইটেল ও ডেসক্রিপশন বাধ্যতামূলক, বাকিগুলো ঐচ্ছিক।")
     await ask(u, s)
 
 def st(u): return STATE.get(u.effective_chat.id)
@@ -273,80 +297,120 @@ async def on_photo(u, c):
     s = st(u)
     if not s or s["step"] != "photos":
         return await u.message.reply_text("এখন ছবির ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন, বা /new দিয়ে নতুন করে শুরু করুন।")
-    if len(s["photos"]) >= 3: return
+    if len(s["photos"]) >= 10: return
     f = await u.message.photo[-1].get_file(); s["photos"].append(bytes(await f.download_as_bytearray()))
     n = len(s["photos"])
-    if n >= 3:
-        await u.message.reply_text("ছবি ৩/৩ পেয়েছি।"); advance(s); await ask(u, s)
+    if n >= 10:
+        await u.message.reply_text("ছবি ১০/১০ পেয়েছি।"); advance(s); await ask(u, s)
     else:
-        await u.message.reply_text(f"ছবি {n}/৩ পেয়েছি। আরও {3 - n}টি পাঠান।")
+        await u.message.reply_text(f"ছবি {n} পেয়েছি। আরও পাঠান, অথবা done লিখুন।")
 
 async def on_video(u, c):
     if not await guard(u): return
     s = st(u)
     if not s or s["step"] != "video":
         return await u.message.reply_text("এখন ভিডিওর ধাপ নয়। বর্তমান প্রশ্নের উত্তর দিন।")
+    if len(s["videos"]) >= 6: return
     try:
         f = await u.message.video.get_file()
-        p = Path(tempfile.mkdtemp()) / "user.mp4"; await f.download_to_drive(p); s["video"] = p
+        p = Path(tempfile.mkdtemp()) / "user.mp4"; await f.download_to_drive(p); s["videos"].append(p)
     except Exception:
         return await u.message.reply_text("ভিডিও নামানো যায়নি (বটের সীমা ২০MB)। ছোট করে আবার পাঠান।")
-    await u.message.reply_text("ভিডিও পেয়েছি।"); advance(s); await ask(u, s)
+    n = len(s["videos"])
+    if n >= 6:
+        await u.message.reply_text("ভিডিও ৬/৬ পেয়েছি।"); advance(s); await ask(u, s)
+    else:
+        await u.message.reply_text(f"ভিডিও {n} পেয়েছি। আরও পাঠান, অথবা done লিখুন।")
 
 async def on_text(u, c):
     if not await guard(u): return
     s = st(u)
     if not s: return await u.message.reply_text("শুরু করতে /new লিখুন।")
     k, t = s["step"], u.message.text.strip()
-    if k == "photos": return await u.message.reply_text(f"এখন ছবি পাঠান ({len(s['photos'])}/৩ পেয়েছি)।")
-    if k == "video": return await u.message.reply_text("এখন ভিডিও পাঠান (বাধ্যতামূলক)।")
-    if k in ("title", "desc"): s[k] = t
-    elif k in ("audience", "offer", "brand"): s[k] = "" if t.lower() == "skip" else t
-    else: return await u.message.reply_text("সব তথ্য জমা হয়েছে। শুরু করতে /go, নতুন করে শুরু করতে /new।")
+    low = t.lower()
+    if k == "photos":
+        if low != "done" or not s["photos"]:
+            return await u.message.reply_text(f"ছবি পাঠান ({len(s['photos'])}টি পেয়েছি)। সব পাঠানো হলে done লিখুন।")
+    elif k == "video":
+        if low not in ("done", "skip"): return await u.message.reply_text("ভিডিও পাঠান। না থাকলে বা শেষ হলে done বা skip লিখুন।")
+    elif k in ("title", "desc"): s[k] = t
+    elif k in ("audience", "offer", "brand"): s[k] = "" if low == "skip" else t
+    else: return await u.message.reply_text("সব তথ্য জমা হয়েছে। /go, /listing বা /all দিন, নতুন করে শুরু করতে /new।")
     advance(s); await ask(u, s)
 
 async def send_text(u, title, blocks):
     txt = title + "\n\n" + "\n\n".join(blocks)
     for i in range(0, len(txt), 3800): await u.message.reply_text(txt[i:i + 3800])
 
-async def go(u, c):
-    if not await guard(u): return
-    s = st(u)
-    if not s or len(s["photos"]) < 3 or not s["video"] or not s["title"] or not s["desc"]: return await u.message.reply_text("আগে /new দিয়ে ৩টি ছবি, ভিডিও, টাইটেল ও ডেসক্রিপশন দিন।")
-    if s["busy"]: return await u.message.reply_text("আগের কাজ চলছে।")
-    s["busy"] = True
-    try:
-        tmp = tempfile.mkdtemp()
-        await u.message.reply_text("পরিকল্পনা তৈরি হচ্ছে...")
-        brief = "\n".join(f"{lab}: {s[key]}" for lab, key in [("Product title (long, from supplier)", "title"), ("Product description", "desc"), ("Target audience", "audience"), ("Offer", "offer"), ("Store name", "brand")] if s[key])
-        plan = await asyncio.to_thread(plan_ads, brief, s["photos"])
-        m, t = plan["meta"], plan["tiktok"]
-        seo = plan["seo"]
-        await send_text(u, "PRODUCT TITLE (SEO)", ["Title: " + seo["title"], "Alternatives:\n- " + "\n- ".join(seo["alternatives"]), "Meta description: " + seo["meta_description"]])
-        await send_text(u, "META (Facebook/Instagram)", [
-            "Headlines:\n- " + "\n- ".join(m["headlines"]), "Primary texts:\n\n" + "\n\n".join(m["primary_texts"]),
-            "Descriptions:\n- " + "\n- ".join(m["descriptions"]), "CTA button: " + m["cta_button"],
-            "Targeting:\n- " + "\n- ".join(m["targeting"])])
-        await send_text(u, "TIKTOK", [
-            "Captions:\n- " + "\n- ".join(t["captions"]), "Hashtags: " + " ".join(t["hashtags"]),
-            "Hooks:\n- " + "\n- ".join(t["hooks"]), "On-screen text:\n- " + "\n- ".join(t["on_screen_text"]), "Tip: " + t["tip"]])
-        await u.message.reply_text("৫টি ছবি তৈরি হচ্ছে (প্রতিটি ৪ সাইজে)...")
-        bases, files = await asyncio.to_thread(make_images, plan, s["photos"], tmp)
-        for style, group in files:
-            await u.message.reply_media_group([InputMediaDocument(open(p, "rb"), caption=(style if i == 0 else None))
-                                               for i, p in enumerate(group)], write_timeout=300)
+async def send_listing(u, L, s):
+    ls = lambda k: ", ".join(L.get(k, []))
+    await send_text(u, "PRODUCT LISTING (SEO)", [
+        f"SEO title: {L.get('seo_title')}\nShort title: {L.get('short_title')}\nSlug: {L.get('slug')}\nFocus keyword: {L.get('focus_keyword')}",
+        f"Meta title: {L.get('meta_title')}\nMeta description: {L.get('meta_description')}",
+        "Keywords: " + ls("keywords"), "Tags: " + ls("tags"), "Categories: " + ls("categories"),
+        "Short description:\n" + str(L.get("short_description", "")), "Bullets:\n- " + "\n- ".join(L.get("bullets", [])),
+        "FAQ:\n" + "\n\n".join(f"Q: {f.get('q')}\nA: {f.get('a')}" for f in L.get("faq", []))])
+    rec = dict(L); rec.update({"id": str(int(time.time())), "status": "draft", "original_title": s["title"],
+                               "brand": s["brand"], "created": time.strftime("%Y-%m-%d")})
+    slug = L.get("slug") or "product"
+    await u.message.reply_document(document=json.dumps(rec, ensure_ascii=False, indent=1).encode(), filename=f"{slug}.json",
+                                   caption="অ্যাডমিন প্যানেলে ইমপোর্ট করার ফাইল")
+    await u.message.reply_document(document=str(L.get("long_description_html", "")).encode(), filename=f"{slug}-description.html",
+                                   caption="ওয়েবসাইটে বসানোর HTML ডেসক্রিপশন")
+    names = L.get("image_filenames") or []
+    group = [InputMediaDocument(s["photos"][i], filename=(names[i] if i < len(names) else f"{slug}-{i+1}.jpg"))
+             for i in range(min(len(s["photos"]), 10))]
+    if group: await u.message.reply_media_group(group, caption="SEO ফাইলনামসহ ছবি (alt text JSON ফাইলে আছে)", write_timeout=300)
+
+async def do_ads(u, s, brief, tmp):
+    vids = s["videos"]; n_ugc = min(len(vids), 3); n_photo = 2 if n_ugc else 3
+    groups = [vids[k::n_ugc] for k in range(n_ugc)]
+    await u.message.reply_text("বিজ্ঞাপনের পরিকল্পনা তৈরি হচ্ছে...")
+    plan = await asyncio.to_thread(plan_ads, brief, s["photos"], n_photo + n_ugc)
+    m, t, seo = plan["meta"], plan["tiktok"], plan["seo"]
+    await send_text(u, "PRODUCT TITLE (SEO)", ["Title: " + seo["title"], "Alternatives:\n- " + "\n- ".join(seo["alternatives"]), "Meta description: " + seo["meta_description"]])
+    await send_text(u, "META (Facebook/Instagram)", [
+        "Headlines:\n- " + "\n- ".join(m["headlines"]), "Primary texts:\n\n" + "\n\n".join(m["primary_texts"]),
+        "Descriptions:\n- " + "\n- ".join(m["descriptions"]), "CTA button: " + m["cta_button"],
+        "Targeting:\n- " + "\n- ".join(m["targeting"])])
+    await send_text(u, "TIKTOK", [
+        "Captions:\n- " + "\n- ".join(t["captions"]), "Hashtags: " + " ".join(t["hashtags"]),
+        "Hooks:\n- " + "\n- ".join(t["hooks"]), "On-screen text:\n- " + "\n- ".join(t["on_screen_text"]), "Tip: " + t["tip"]])
+    await u.message.reply_text("৫টি ছবি তৈরি হচ্ছে (প্রতিটি ৪ সাইজে)...")
+    bases, files = await asyncio.to_thread(make_images, plan, s["photos"], tmp)
+    for style, group in files:
+        await u.message.reply_media_group([InputMediaDocument(open(p, "rb"), caption=(style if i == 0 else None))
+                                           for i, p in enumerate(group)], write_timeout=300)
+    for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
+    WARN.clear()
+    pool = [Image.open(io.BytesIO(b)) for b in bases] + [Image.open(io.BytesIO(b)) for b in s["photos"]]
+    vplans = plan["videos"][:n_photo + n_ugc]
+    for idx, vp in enumerate(vplans):
+        await u.message.reply_text(f"ভিডিও {idx+1}/{len(vplans)} তৈরি হচ্ছে: {vp['style']}")
+        clips = groups[idx - n_photo] if idx >= n_photo else None
+        outs = await asyncio.to_thread(make_video, idx, vp, pool, clips, tmp)
         for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
         WARN.clear()
-        pool = [Image.open(io.BytesIO(b)) for b in bases] + [Image.open(io.BytesIO(b)) for b in s["photos"]]
-        for idx, vp in enumerate(plan["videos"][:3]):
-            await u.message.reply_text(f"ভিডিও {idx+1}/৩ তৈরি হচ্ছে: {vp['style']}")
-            outs = await asyncio.to_thread(make_video, idx, vp, pool, s["video"], tmp)
-            for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
-            WARN.clear()
-            for path, W, H in outs:
-                with open(path, "rb") as fh:
-                    await u.message.reply_video(fh, width=W, height=H, supports_streaming=True,
-                                                caption=f"{vp['style']} ({W}x{H})", write_timeout=300)
+        for path, W, H in outs:
+            with open(path, "rb") as fh:
+                await u.message.reply_video(fh, width=W, height=H, supports_streaming=True,
+                                            caption=f"{vp['style']} ({W}x{H})", write_timeout=300)
+
+async def runner(u, ads, lst):
+    if not await guard(u): return
+    s = st(u)
+    if not s or not s["photos"] or not s["title"] or not s["desc"]:
+        return await u.message.reply_text("আগে /new দিয়ে অন্তত ১টি ছবি, টাইটেল ও ডেসক্রিপশন দিন।")
+    if s["busy"]: return await u.message.reply_text("আগের কাজ চলছে।")
+    s["busy"] = True; IMG_OFF[0] = False
+    try:
+        tmp = tempfile.mkdtemp()
+        brief = "\n".join(f"{lab}: {s[key]}" for lab, key in [("Product title (long, from supplier)", "title"), ("Product description", "desc"), ("Target audience", "audience"), ("Offer", "offer"), ("Store name", "brand")] if s[key])
+        if lst:
+            await u.message.reply_text("লিস্টিং তৈরি হচ্ছে...")
+            L = await asyncio.to_thread(plan_listing, brief, s["photos"])
+            await send_listing(u, L, s)
+        if ads: await do_ads(u, s, brief, tmp)
         await u.message.reply_text("শেষ। নতুন প্রোডাক্টের জন্য /new।")
     except Exception as e:
         logging.exception("pipeline failed")
@@ -354,6 +418,10 @@ async def go(u, c):
     finally:
         s["busy"] = False
         LAST[0] = time.time()
+
+async def go(u, c): await runner(u, True, False)
+async def listing_cmd(u, c): await runner(u, False, True)
+async def all_cmd(u, c): await runner(u, True, True)
 
 async def on_error(update, context):
     logging.warning("bot error: %s: %s", type(context.error).__name__, str(context.error)[:200])
@@ -370,7 +438,7 @@ def main():
     notify('বট চালু হয়েছে। /new দিয়ে শুরু করুন।' + (f' {n} মিনিট কিছু না করলে নিজে বন্ধ হবে।' if n not in ('', '0') else ''))
     app = Application.builder().token(TOKEN).concurrent_updates(True).read_timeout(120).write_timeout(300).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("new", new))
-    app.add_handler(CommandHandler("go", go))
+    app.add_handler(CommandHandler("go", go)); app.add_handler(CommandHandler("listing", listing_cmd)); app.add_handler(CommandHandler("all", all_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo)); app.add_handler(MessageHandler(filters.VIDEO, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
