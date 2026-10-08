@@ -4,8 +4,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from google import genai
 from google.genai import types
-from telegram import Update, InputMediaDocument
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -143,6 +143,81 @@ def plan_listing(brief, photos):
              config=types.GenerateContentConfig(response_mime_type="application/json"))
     return json.loads(r.text)
 
+# ---------- AI model shots (human model photos + AI video clips) ----------
+AI_VIDEO = (os.getenv("AI_VIDEO") or "").strip().lower() in ("1", "true", "yes", "on")
+AI_VIDEO_MODEL = os.getenv("AI_VIDEO_MODEL") or "veo-3.1-generate-preview"
+
+MPROMPT = """You are a creative director for US social media ads.
+Product info:
+{brief}
+The attached photos show the real product.
+Create {n} "model shots": short scenes where an adult human model (18+) naturally holds or uses the product. If a person does not make sense for this product, use a natural lifestyle scene with the product instead.
+Rules: American English; the product must stay exactly as in the photos (shape, color, logo); no added text or logos; no speech or dialogue; no medical claims.
+Return ONLY JSON: {{"shots":[{n} objects {{"scene":str (short label),"image_prompt":str (detailed, photorealistic, vertical 9:16 composition, says to keep the product exactly as in the reference photo),"video_prompt":str (8-second motion: camera move and model action, no dialogue, no on-screen text, product unchanged)}}]}}"""
+
+def plan_models(brief, photos, n):
+    parts = [types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in photos[:4]]
+    r = call(model=TEXT_MODEL, contents=parts + [MPROMPT.format(brief=brief, n=n)],
+             config=types.GenerateContentConfig(response_mime_type="application/json"))
+    return json.loads(r.text)
+
+def model_photos(shots, photos, tmp):
+    res = []
+    for i, sh in enumerate(shots):
+        raw = gen_image(sh["image_prompt"], photos[i % len(photos)])
+        paths = []
+        if raw:
+            im = Image.open(io.BytesIO(raw))
+            for key in ("1x1", "4x5", "9x16"):
+                w, h = IMG_SIZES[key]
+                p = Path(tmp) / f"model{i+1}_{key}.jpg"
+                fit_blur(im, w, h).save(p, quality=92); paths.append(p)
+        res.append((sh.get("scene", f"Model shot {i+1}"), raw, paths))
+    return res
+
+def ai_clip(prompt, frame_bytes, out):
+    im = fit_blur(Image.open(io.BytesIO(frame_bytes)), 720, 1280)
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    op = client.models.generate_videos(
+        model=AI_VIDEO_MODEL, prompt=prompt,
+        image=types.Image(image_bytes=buf.getvalue(), mime_type="image/png"),
+        config=types.GenerateVideosConfig(aspect_ratio="9:16"))
+    t0 = time.time()
+    while not op.done:
+        if time.time() - t0 > 900: raise TimeoutError("AI video took too long")
+        time.sleep(10); op = client.operations.get(op)
+    v = op.response.generated_videos[0]
+    try:
+        client.files.download(file=v.video)
+        v.video.save(str(out))
+    except Exception:
+        client.files.download(file=v.video, destination=str(out))
+    return out
+
+def finish_clip(clip, cta, tmp, idx):
+    tmp = Path(tmp)
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(clip)],
+                       capture_output=True, text=True)
+    try: dur = float(r.stdout.strip())
+    except ValueError: dur = 8.0
+    outs = []
+    for key, (W, H) in VID_SIZES.items():
+        cp = tmp / f"cta{idx}_{key}.png"
+        caption(Image.new("RGBA", (W, H), (0, 0, 0, 0)), cta, 0.86, W // 12).save(cp)
+        mid = tmp / f"ai{idx}_{key}_m.mp4"; fin = tmp / f"aivideo{idx+1}_{key}.mp4"
+        f = (f"[0:v]split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=25:5[bg];"
+             f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[v0];"
+             f"[v0][1:v]overlay=0:0:enable='gte(t,{max(dur-2.5, 0):.2f})'[v]")
+        run(["ffmpeg", "-y", "-i", str(clip), "-i", str(cp), "-filter_complex", f, "-map", "[v]", "-t", f"{dur:.2f}",
+             "-r", "30", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-an", str(mid)])
+        mux(mid, None, fin, dur)
+        outs.append((fin, W, H))
+    return outs
+
+def make_ai_video(i, shot, frame, cta, tmp):
+    clip = ai_clip(shot["video_prompt"], frame, Path(tmp) / f"aiclip{i}.mp4")
+    return finish_clip(clip, cta, tmp, i)
+
 def make_images(plan, photos, tmp):
     bases, files = [], []
     for i, it in enumerate(plan["images"][:5]):
@@ -276,8 +351,48 @@ async def ask(u, s):
         "সব তথ্য পেয়েছি:\n"
         f"• টাইটেল: {s['title'][:120]}\n• ছবি: {len(s['photos'])}টি\n• ভিডিও: {len(s['videos'])}টি\n"
         f"• অডিয়েন্স: {s['audience'] or 'অনুমান করা হবে'}\n• অফার: {s['offer'] or 'নেই'}\n• স্টোর: {s['brand'] or 'নেই'}\n\n"
-        "এখন কোনটা বানাবো?\n/go : বিজ্ঞাপন কিট (ছবি, ভিডিও, Meta ও TikTok টেক্সট)\n"
-        "/listing : প্রোডাক্ট লিস্টিং (SEO টাইটেল, ডেসক্রিপশন, ট্যাগ, FAQ)\n/all : দুটোই\n\nনতুন করে শুরু করতে /new।")
+        "নিচের বোতাম থেকে বেছে নিন।\n"
+        "• AI মডেল ON: মডেলের AI ছবি ও AI ভিডিও (Veo) যোগ হবে। এতে খরচ বেশি।\n"
+        "• AI মডেল OFF: শুধু আপনার ছবি-ভিডিও থেকে অ্যাড হবে।\n"
+        "• 🚀 সব: বিজ্ঞাপন কিট ও লিস্টিং দুটোই।\n\n"
+        "নতুন করে শুরু করতে /new।", reply_markup=keyboard(s))
+
+def keyboard(s):
+    on = s.get("ai", False)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if on else "") + "AI মডেল ON", callback_data="ai1"),
+         InlineKeyboardButton(("✅ " if not on else "") + "AI মডেল OFF", callback_data="ai0")],
+        [InlineKeyboardButton("🎬 বিজ্ঞাপন কিট", callback_data="ads"), InlineKeyboardButton("📝 লিস্টিং", callback_data="lst")],
+        [InlineKeyboardButton("🚀 সব বানাও (কিট + লিস্টিং)", callback_data="all")]])
+
+class Shim:
+    """Lets button presses reuse the same handlers as typed commands."""
+    def __init__(self, u):
+        self.message = u.callback_query.message; self.effective_chat = u.effective_chat; self.effective_user = u.effective_user
+
+async def on_button(u, c):
+    q = u.callback_query
+    try: await q.answer()
+    except Exception: pass
+    sh = Shim(u)
+    if not await guard(sh): return
+    s = st(sh)
+    if not s: return await q.message.reply_text("শুরু করতে /new লিখুন।")
+    d = q.data
+    if d in ("ai1", "ai0"):
+        s["ai"] = (d == "ai1")
+        try: await q.edit_message_reply_markup(reply_markup=keyboard(s))
+        except Exception: pass
+        return
+    if d == "ads": await runner(sh, True, False)
+    elif d == "lst": await runner(sh, False, True)
+    elif d == "all": await runner(sh, True, True)
+
+async def ai_cmd(u, c):
+    if not await guard(u): return
+    s = st(u)
+    if not s: return await u.message.reply_text("শুরু করতে /new লিখুন।")
+    await u.message.reply_text("AI মডেল ON করলে মডেলের AI ছবি ও AI ভিডিও (Veo) বানানো হবে, খরচ বেশি। বেছে নিন:", reply_markup=keyboard(s))
 
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await guard(u): return
@@ -286,7 +401,7 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def new(u, c):
     if not await guard(u): return
     s = STATE[u.effective_chat.id] = {"step": "photos", "photos": [], "videos": [], "busy": False,
-                                      "title": "", "desc": "", "audience": "", "offer": "", "brand": ""}
+                                      "title": "", "desc": "", "audience": "", "offer": "", "brand": "", "ai": AI_VIDEO}
     await u.message.reply_text("নতুন প্রোডাক্ট শুরু করছি। মোট ৭টি ধাপ: ছবি, টাইটেল ও ডেসক্রিপশন বাধ্যতামূলক, বাকিগুলো ঐচ্ছিক।")
     await ask(u, s)
 
@@ -396,12 +511,40 @@ async def do_ads(u, s, brief, tmp):
                 await u.message.reply_video(fh, width=W, height=H, supports_streaming=True,
                                             caption=f"{vp['style']} ({W}x{H})", write_timeout=300)
 
-async def runner(u, ads, lst):
+async def do_models(u, s, brief, tmp):
+    n = int(os.getenv("MODEL_SHOTS") or 3)
+    await u.message.reply_text("AI মডেল শটের পরিকল্পনা তৈরি হচ্ছে...")
+    shots = (await asyncio.to_thread(plan_models, brief, s["photos"], n))["shots"][:n]
+    await u.message.reply_text(f"AI মডেল ছবি তৈরি হচ্ছে ({len(shots)}টি, প্রতিটি ৩ সাইজে)...")
+    res = await asyncio.to_thread(model_photos, shots, s["photos"], tmp)
+    for scene, raw, paths in res:
+        if paths:
+            await u.message.reply_media_group([InputMediaDocument(open(p, "rb"), caption=(scene if i == 0 else None))
+                                               for i, p in enumerate(paths)], write_timeout=300)
+    for w in dict.fromkeys(WARN): await u.message.reply_text("⚠ " + w)
+    WARN.clear()
+    clips_n = int(os.getenv("AI_VIDEO_CLIPS") or 2)
+    cta = f"Shop now at {s['brand']}" if s["brand"] else "Shop now"
+    for i, (shot, (scene, raw, _)) in enumerate(list(zip(shots, res))[:clips_n]):
+        await u.message.reply_text(f"AI ভিডিও {i+1}/{min(clips_n, len(shots))} তৈরি হচ্ছে (কয়েক মিনিট লাগে): {scene}")
+        try:
+            outs = await asyncio.to_thread(make_ai_video, i, shot, raw or s["photos"][i % len(s["photos"])], cta, tmp)
+        except Exception as e:
+            logging.exception("ai video failed")
+            await u.message.reply_text(f"⚠ AI ভিডিও হয়নি: {type(e).__name__}: {str(e)[:250]}")
+            continue
+        for path, W, H in outs:
+            with open(path, "rb") as fh:
+                await u.message.reply_video(fh, width=W, height=H, supports_streaming=True,
+                                            caption=f"AI model video: {scene} ({W}x{H})", write_timeout=300)
+
+async def runner(u, ads, lst, mod=False):
     if not await guard(u): return
     s = st(u)
     if not s or not s["photos"] or not s["title"] or not s["desc"]:
         return await u.message.reply_text("আগে /new দিয়ে অন্তত ১টি ছবি, টাইটেল ও ডেসক্রিপশন দিন।")
     if s["busy"]: return await u.message.reply_text("আগের কাজ চলছে।")
+    mod = mod or (ads and s.get("ai", False))
     s["busy"] = True; IMG_OFF[0] = False
     try:
         tmp = tempfile.mkdtemp()
@@ -411,6 +554,7 @@ async def runner(u, ads, lst):
             L = await asyncio.to_thread(plan_listing, brief, s["photos"])
             await send_listing(u, L, s)
         if ads: await do_ads(u, s, brief, tmp)
+        if mod: await do_models(u, s, brief, tmp)
         await u.message.reply_text("শেষ। নতুন প্রোডাক্টের জন্য /new।")
     except Exception as e:
         logging.exception("pipeline failed")
@@ -422,6 +566,11 @@ async def runner(u, ads, lst):
 async def go(u, c): await runner(u, True, False)
 async def listing_cmd(u, c): await runner(u, False, True)
 async def all_cmd(u, c): await runner(u, True, True)
+async def model_cmd(u, c):
+    s = st(u)
+    if s and not s.get("ai"):
+        return await u.message.reply_text("AI মডেল এখন OFF আছে। /ai দিয়ে ON করে তারপর বানান।")
+    await runner(u, False, False, True)
 
 async def on_error(update, context):
     logging.warning("bot error: %s: %s", type(context.error).__name__, str(context.error)[:200])
@@ -438,7 +587,7 @@ def main():
     notify('বট চালু হয়েছে। /new দিয়ে শুরু করুন।' + (f' {n} মিনিট কিছু না করলে নিজে বন্ধ হবে।' if n not in ('', '0') else ''))
     app = Application.builder().token(TOKEN).concurrent_updates(True).read_timeout(120).write_timeout(300).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("new", new))
-    app.add_handler(CommandHandler("go", go)); app.add_handler(CommandHandler("listing", listing_cmd)); app.add_handler(CommandHandler("all", all_cmd))
+    app.add_handler(CommandHandler("go", go)); app.add_handler(CommandHandler("listing", listing_cmd)); app.add_handler(CommandHandler("all", all_cmd)); app.add_handler(CommandHandler("model", model_cmd)); app.add_handler(CommandHandler("ai", ai_cmd)); app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo)); app.add_handler(MessageHandler(filters.VIDEO, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
