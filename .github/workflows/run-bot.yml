@@ -1,0 +1,24 @@
+name: Run ad bot
+on:
+  workflow_dispatch:
+    inputs:
+      idle_minutes:
+        description: "কত মিনিট কাজ না থাকলে বট নিজে বন্ধ হবে"
+        default: "30"
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - run: pip install -r requirements.txt
+      - run: python bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          IDLE_MINUTES: ${{ inputs.idle_minutes }}
